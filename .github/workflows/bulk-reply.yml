@@ -1,0 +1,132 @@
+name: Bulk Reply Issues and PRs
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start issue/PR number"
+        required: true
+        type: number
+      end:
+        description: "End issue/PR number (inclusive)"
+        required: true
+        type: number
+      message:
+        description: "Reply message"
+        required: false
+        default: "Thanks for contributing to IvorySQL!"
+        type: string
+      skip_closed:
+        description: "Skip closed issues/PRs"
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: "Dry run (log only, do not post comments)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  reply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment on issues/PRs without maintainer reply
+        uses: actions/github-script@v7
+        env:
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+          MESSAGE: ${{ inputs.message }}
+          SKIP_CLOSED: ${{ inputs.skip_closed }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        with:
+          script: |
+            const start = parseInt(process.env.START, 10);
+            const end = parseInt(process.env.END, 10);
+            const message = process.env.MESSAGE;
+            const skipClosed = process.env.SKIP_CLOSED === 'true';
+            const dryRun = process.env.DRY_RUN === 'true';
+
+            // Author associations treated as maintainers
+            const MAINTAINER_ROLES = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+
+            // Validate the input range
+            if (isNaN(start) || isNaN(end) || start > end) {
+              core.setFailed(`Invalid range: ${start} - ${end}`);
+              return;
+            }
+            // Guard against accidentally processing too many items at once
+            if (end - start > 200) {
+              core.setFailed('Range too large (max 200), please run in batches');
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+            let ok = 0, skipped = 0, failed = 0;
+
+            for (let n = start; n <= end; n++) {
+              try {
+                // Issues and PRs share the same number space,
+                // so the issues API works for both
+                const { data: issue } = await github.rest.issues.get({
+                  owner, repo, issue_number: n,
+                });
+                const kind = issue.pull_request ? 'PR' : 'issue';
+
+                if (skipClosed && issue.state === 'closed') {
+                  core.info(`#${n} (${kind}) is closed, skipping`); skipped++; continue;
+                }
+
+                // Conversation comments only (reviews and inline comments are ignored)
+                const comments = await github.paginate(
+                  github.rest.issues.listComments,
+                  { owner, repo, issue_number: n, per_page: 100 }
+                );
+
+                // Skip if a maintainer has already replied (bots are ignored)
+                const maintainerComment = comments.find(c =>
+                  c.user &&
+                  c.user.type !== 'Bot' &&
+                  MAINTAINER_ROLES.includes(c.author_association)
+                );
+                if (maintainerComment) {
+                  core.info(`#${n} (${kind}) already replied by maintainer @${maintainerComment.user.login}, skipping`);
+                  skipped++; continue;
+                }
+
+                // Skip if the same reply was already posted by a bot
+                // (makes re-running the workflow idempotent)
+                const alreadyReplied = comments.some(c =>
+                  c.user && c.user.type === 'Bot' && c.body.trim() === message.trim()
+                );
+                if (alreadyReplied) {
+                  core.info(`#${n} (${kind}) already has the same reply, skipping`);
+                  skipped++; continue;
+                }
+
+                if (dryRun) {
+                  core.info(`#${n} (${kind}) [dry-run] would post a reply`);
+                } else {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: n, body: message,
+                  });
+                  core.info(`#${n} (${kind}) replied`);
+                }
+                ok++;
+              } catch (e) {
+                if (e.status === 404) {
+                  core.info(`#${n} not found, skipping`); skipped++;
+                } else {
+                  core.warning(`#${n} failed: ${e.message}`); failed++;
+                }
+              }
+              // Throttle requests to avoid GitHub secondary rate limits
+              await new Promise(r => setTimeout(r, 1500));
+            }
+
+            core.info(`Done: ${dryRun ? 'would reply' : 'replied'} ${ok}, skipped ${skipped}, failed ${failed}`);
+            if (failed > 0) core.setFailed(`${failed} item(s) failed`);
